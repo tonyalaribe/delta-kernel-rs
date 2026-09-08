@@ -160,11 +160,9 @@ pub mod tokio {
 
             let fut = Box::pin(async move {
                 let task_output = task.await;
-                tokio::task::spawn_blocking(move || {
-                    sender.send(task_output).ok();
-                })
-                .await
-                .unwrap();
+                // This unbounded channel does not wait for the receiver. Deliver
+                // directly: the receiver may occupy the last blocking thread.
+                sender.send(task_output).ok();
             });
 
             self.send_future(fut);
@@ -260,9 +258,8 @@ pub mod tokio {
     impl TaskExecutor for TokioMultiThreadExecutor {
         type Guard<'a> = EnterGuard<'a>;
 
-        // `block_on` uses `block_in_place`; If concurrent `block_on` calls exceed Tokio's
-        // `max_blocking_threads`, this can deadlock See:
-        // https://docs.rs/tokio/latest/tokio/runtime/struct.Builder.html#method.max_blocking_threads
+        // Blocking callers can fill the blocking pool. Result delivery must stay
+        // on the async runtime so those callers can release their threads.
         fn block_on<T>(&self, task: T) -> T::Output
         where
             T: Future + Send + 'static,
@@ -275,11 +272,9 @@ pub mod tokio {
 
             let fut = Box::pin(async move {
                 let task_output = task.await;
-                tokio::task::spawn_blocking(move || {
-                    sender.send(task_output).ok();
-                })
-                .await
-                .unwrap();
+                // This unbounded channel does not wait for the receiver. Deliver
+                // directly: the receiver may occupy the last blocking thread.
+                sender.send(task_output).ok();
             });
 
             // We throw away the handle, but it should continue on.
@@ -327,6 +322,39 @@ pub mod tokio {
     #[cfg(test)]
     mod test {
         use super::*;
+
+        #[test]
+        fn result_delivery_does_not_need_a_free_blocking_thread() {
+            use std::time::Duration;
+
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .max_blocking_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
+            let executor = TokioMultiThreadExecutor::new(runtime.handle().clone());
+            let result = runtime.block_on(async move {
+                tokio::time::timeout(
+                    Duration::from_secs(1),
+                    tokio::task::spawn_blocking(move || {
+                        executor.block_on(async {
+                            tokio::task::yield_now().await;
+                            42
+                        })
+                    }),
+                )
+                .await
+            });
+            // A failing regression must not hang the test process during teardown.
+            runtime.shutdown_timeout(Duration::from_millis(100));
+            assert_eq!(
+                result
+                    .expect("result delivery exhausted the blocking pool")
+                    .unwrap(),
+                42
+            );
+        }
 
         async fn test_executor(executor: impl TaskExecutor) {
             // Can run a task
