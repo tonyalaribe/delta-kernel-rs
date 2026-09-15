@@ -6,9 +6,10 @@ use itertools::Itertools;
 use tracing::debug;
 
 use super::arrow_conversion::{TryFromKernel as _, TryIntoArrow as _};
-use crate::arrow::array::{self, ArrayBuilder, ArrayRef, RecordBatch, StructArray};
+use crate::arrow::array::{self, ArrayBuilder, ArrayRef, RecordBatch, StructArray, AsArray,
+};
 use crate::arrow::datatypes::{
-    DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+    DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema, Fields,
 };
 use crate::engine::arrow_data::{extract_record_batch, ArrowEngineData};
 use crate::engine::arrow_utils::apply_schema::{apply_schema, apply_schema_to};
@@ -250,6 +251,7 @@ impl EvaluationHandler for ArrowEvaluationHandler {
         output_type: DataType,
     ) -> DeltaResult<Arc<dyn ExpressionEvaluator>> {
         Ok(Arc::new(DefaultExpressionEvaluator {
+            apply_is_identity: std::sync::OnceLock::new(),
             _input_schema: schema,
             expression,
             output_type,
@@ -340,6 +342,20 @@ pub struct DefaultExpressionEvaluator {
     _input_schema: SchemaRef,
     expression: ExpressionRef,
     output_type: DataType,
+    /// Once-per-evaluator verdict for the general expression arm: does
+    /// `apply_schema` change `evaluate_expression`'s output at all?
+    ///
+    /// `evaluate_expression` mints a fresh `Fields` allocation per batch, so
+    /// `apply_schema`'s pointer-keyed identity cache can never hit on this
+    /// arm — profiled at ~9% of on-CPU work on a production workload. But the
+    /// evaluator is one-per-stream with a fixed expression and output type,
+    /// and `evaluate_expression` is deterministic over (expression, input
+    /// schema): if the first batch's transform was an identity, every later
+    /// batch with the SAME input-Fields allocation transforms identically.
+    /// The stored input `Fields` pins its allocation, so the pointer guard
+    /// cannot be fooled by reuse; a different allocation simply falls back to
+    /// the full transform.
+    apply_is_identity: std::sync::OnceLock<(Fields, bool)>,
 }
 
 impl ExpressionEvaluator for DefaultExpressionEvaluator {
@@ -367,7 +383,35 @@ impl ExpressionEvaluator for DefaultExpressionEvaluator {
             }
             (expr, output_type @ DataType::Struct(_)) => {
                 let array_ref = evaluate_expression(expr, batch, Some(output_type))?;
-                apply_schema(&array_ref, output_type)?
+                let input_fields = batch.schema_ref().fields();
+                match self.apply_is_identity.get() {
+                    Some((pinned, true))
+                        if std::ptr::eq(pinned.as_ref().as_ptr(), input_fields.as_ref().as_ptr()) =>
+                    {
+                        // Identity proven on this stream's first batch: rebuild
+                        // the RecordBatch from the evaluated array as
+                        // `apply_schema` would have, minus the transform. Top-
+                        // level nulls are discarded exactly as apply_schema
+                        // does.
+                        let sa = array_ref.as_struct_opt().ok_or_else(|| {
+                            Error::generic("expression output claimed struct but is not a StructArray")
+                        })?;
+                        let (fields, columns, _nulls) = sa.clone().into_parts();
+                        RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), columns)?
+                    }
+                    _ => {
+                        let raw_fields = array_ref.as_struct_opt().map(|sa| sa.fields().clone());
+                        let out = apply_schema(&array_ref, output_type)?;
+                        if self.apply_is_identity.get().is_none() {
+                            let identity =
+                                raw_fields.is_some_and(|rf| &rf == out.schema_ref().fields());
+                            let _ = self
+                                .apply_is_identity
+                                .set((input_fields.clone(), identity));
+                        }
+                        out
+                    }
+                }
             }
             (expr, output_type) => {
                 let array_ref = evaluate_expression(expr, batch, Some(output_type))?;

@@ -1499,3 +1499,85 @@ fn test_void_scalar_to_array() {
     assert_eq!(array.len(), 5);
     assert_eq!(*array.data_type(), DataType::Null);
 }
+
+/// The evaluator memoizes "apply_schema is an identity" after its first batch
+/// and then skips the transform for batches sharing the same input-Fields
+/// allocation. Correctness bar: the fast path's output must be
+/// indistinguishable from the slow path's, and the memo must never leak
+/// across input allocations.
+#[test]
+fn evaluator_identity_memo_matches_the_full_transform() {
+    use crate::expressions::column_expr_ref;
+    let kschema = Arc::new(StructType::new_unchecked([
+        StructField::nullable("a", KernelDataType::INTEGER),
+        StructField::nullable("b", KernelDataType::STRING),
+    ]));
+    let out_type = KernelDataType::Struct(Box::new(StructType::new_unchecked([
+        StructField::nullable("a", KernelDataType::INTEGER),
+    ])));
+    let handler = ArrowEvaluationHandler;
+    let eval = handler
+        .new_expression_evaluator(
+            kschema.clone(),
+            Arc::new(Expression::Struct(vec![column_expr_ref!("a")], None)),
+            out_type,
+        )
+        .unwrap();
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("a", DataType::Int32, true),
+        Field::new("b", DataType::Utf8, true),
+    ]));
+    let mk = |vals: Vec<i32>| {
+        let n = vals.len();
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vals)),
+                Arc::new(StringArray::from(vec!["x"; n])),
+            ],
+        )
+        .unwrap()
+    };
+
+    // Batch 1 computes the verdict; batch 2 (same Fields allocation) takes the
+    // memoized path. Their schemas must agree exactly and values pass through.
+    let b1 = mk(vec![1, 2, 3]);
+    let b2 = mk(vec![4, 5]);
+    let r1 = eval
+        .evaluate(&ArrowEngineData::new(b1))
+        .unwrap()
+        .try_into_record_batch()
+        .unwrap();
+    let r2 = eval
+        .evaluate(&ArrowEngineData::new(b2))
+        .unwrap()
+        .try_into_record_batch()
+        .unwrap();
+    assert_eq!(r1.schema(), r2.schema(), "memoized path must produce the identical schema");
+    assert_eq!(r2.num_rows(), 2);
+    let col = r2.column(0).as_primitive::<crate::arrow::datatypes::Int32Type>();
+    assert_eq!(col.values(), &[4, 5], "values must pass through the fast path untouched");
+
+    // A batch from a DIFFERENT Fields allocation must not be served by the
+    // memo (pointer guard) — output still correct via the full transform.
+    let other_schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("a", DataType::Int32, true),
+        Field::new("b", DataType::Utf8, true),
+    ]));
+    let b3 = RecordBatch::try_new(
+        other_schema,
+        vec![
+            Arc::new(Int32Array::from(vec![7])),
+            Arc::new(StringArray::from(vec!["y"])),
+        ],
+    )
+    .unwrap();
+    let r3 = eval
+        .evaluate(&ArrowEngineData::new(b3))
+        .unwrap()
+        .try_into_record_batch()
+        .unwrap();
+    assert_eq!(r3.schema(), r1.schema());
+    assert_eq!(r3.num_rows(), 1);
+}
