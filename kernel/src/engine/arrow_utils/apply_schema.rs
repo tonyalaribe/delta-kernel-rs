@@ -75,7 +75,7 @@ pub(crate) fn apply_schema(array: &dyn Array, schema: &DataType) -> DeltaResult<
 }
 
 /// Slice data pointer of the `Fields` allocation — stable for its lifetime,
-/// pinned by the Arc clone stored in the cache entry.
+/// pinned by the Fields clone stored in the cache entry.
 fn identity_cache_key(fields: &Fields) -> usize {
     fields.as_ref().as_ptr() as usize
 }
@@ -84,58 +84,61 @@ struct IdentityEntry {
     key: usize,
     /// Pins the allocation behind `key`.
     _input_fields: Fields,
-    /// The exact target schema the verdict was computed against. A name/count
-    /// fingerprint would let two schemas that differ only in the middle (a
-    /// type widening, a metadata change) share a verdict, so equality is
-    /// exact — but checked by POINTER first: the last schema address that
-    /// deep-compared equal is memoized, and the deep walk only re-runs when
-    /// the caller presents a different address (a new snapshot). Deployed
-    /// with a per-hit deep compare, ~70% of the fast path's samples were the
-    /// comparison plus a contended global Mutex; hits must be read-only and
-    /// O(1).
+    /// The exact target schema the verdict was computed against. Compared by
+    /// memoized pointer first; the deep walk re-runs only when the caller
+    /// presents a new address (a new snapshot).
     schema: Schema,
-    last_schema_ptr: std::sync::atomic::AtomicUsize,
+    last_schema_ptr: usize,
     identity: bool,
 }
 
-fn identity_cache() -> &'static std::sync::RwLock<Vec<IdentityEntry>> {
-    static CACHE: std::sync::OnceLock<std::sync::RwLock<Vec<IdentityEntry>>> =
-        std::sync::OnceLock::new();
-    CACHE.get_or_init(Default::default)
+/// Verdict cache, THREAD-LOCAL by design. Two shared designs failed in
+/// production profiles before this one: a global Mutex put 70% of the fast
+/// path's samples into lock_contended, and the RwLock that replaced it moved
+/// them to read_contended — at per-batch frequency across thirty-plus scan
+/// threads, any shared word is the bottleneck, reader-writer or not. A
+/// verdict is pure memoization, so duplicating it per thread costs a few
+/// redundant transforms per stream and removes synchronization entirely.
+const IDENTITY_CACHE_MAX: usize = 8;
+
+thread_local! {
+    static IDENTITY_CACHE: std::cell::RefCell<Vec<IdentityEntry>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 fn identity_cache_hit(key: usize, schema: &Schema) -> bool {
-    use std::sync::atomic::Ordering;
     let schema_ptr = schema as *const Schema as usize;
-    let cache = identity_cache().read().unwrap();
-    for e in cache.iter().filter(|e| e.key == key) {
-        if e.last_schema_ptr.load(Ordering::Relaxed) == schema_ptr {
-            return e.identity;
+    IDENTITY_CACHE.with(|c| {
+        let mut cache = c.borrow_mut();
+        for e in cache.iter_mut().filter(|e| e.key == key) {
+            if e.last_schema_ptr == schema_ptr {
+                return e.identity;
+            }
+            if &e.schema == schema {
+                e.last_schema_ptr = schema_ptr;
+                return e.identity;
+            }
         }
-        if &e.schema == schema {
-            e.last_schema_ptr.store(schema_ptr, Ordering::Relaxed);
-            return e.identity;
-        }
-    }
-    false
+        false
+    })
 }
 
-const IDENTITY_CACHE_MAX: usize = 32;
-
 fn identity_cache_insert(key: usize, fields: Fields, schema: Schema, identity: bool) {
-    let mut cache = identity_cache().write().unwrap();
-    if cache.iter().any(|e| e.key == key && e.schema == schema) {
-        return;
-    }
-    if cache.len() >= IDENTITY_CACHE_MAX {
-        cache.remove(0);
-    }
-    cache.push(IdentityEntry {
-        key,
-        _input_fields: fields,
-        last_schema_ptr: std::sync::atomic::AtomicUsize::new(0),
-        schema,
-        identity,
+    IDENTITY_CACHE.with(|c| {
+        let mut cache = c.borrow_mut();
+        if cache.iter().any(|e| e.key == key && e.schema == schema) {
+            return;
+        }
+        if cache.len() >= IDENTITY_CACHE_MAX {
+            cache.remove(0);
+        }
+        cache.push(IdentityEntry {
+            key,
+            _input_fields: fields,
+            last_schema_ptr: 0,
+            schema,
+            identity,
+        });
     });
 }
 
