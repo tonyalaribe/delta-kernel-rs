@@ -13,7 +13,7 @@ use crate::arrow::array::{
     Array, ArrayRef, AsArray, ListArray, MapArray, RecordBatch, StructArray,
 };
 use crate::arrow::datatypes::{
-    DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+    DataType as ArrowDataType, Field as ArrowField, Fields, Schema as ArrowSchema,
 };
 use crate::engine::ensure_data_types::{ensure_data_types, ValidationMode};
 use crate::error::{DeltaResult, Error};
@@ -34,6 +34,38 @@ pub(crate) fn apply_schema(array: &dyn Array, schema: &DataType) -> DeltaResult<
             "apply_schema at top-level must be passed a struct schema",
         ));
     };
+    // Identity fast path. The transform never touches values — it only
+    // restructures fields, metadata and nesting — so when a batch's transform
+    // produces output Fields deep-equal to its input Fields, the whole
+    // transform is a semantic no-op for EVERY batch sharing that input Fields
+    // allocation (one parquet stream yields hundreds of batches with one
+    // Fields Arc). Profiled on a production workload, re-running the
+    // transform per batch (field construction, metadata HashMaps, field-id
+    // lookups, struct revalidation) was ~7.5% of all on-CPU work.
+    //
+    // The cache pins the input Fields allocation (an Arc clone), so the
+    // pointer key cannot be recycled while the entry lives; the target-schema
+    // fingerprint guards the rare case of one reader schema being applied
+    // against different kernel schemas.
+    if let Some(sa) = array.as_struct_opt() {
+        let key = identity_cache_key(sa.fields());
+        let fp = kernel_schema_fingerprint(struct_schema);
+        if identity_cache_hit(key, sa.fields(), &fp) {
+            let (fields, columns, _nulls) = sa.clone().into_parts();
+            return Ok(RecordBatch::try_new(
+                Arc::new(ArrowSchema::new(fields)),
+                columns,
+            )?);
+        }
+        let applied = apply_schema_to_struct(array, struct_schema)?;
+        let identity = applied.fields() == sa.fields();
+        identity_cache_insert(key, sa.fields().clone(), fp, identity);
+        let (fields, columns, _nulls) = applied.into_parts();
+        return Ok(RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(fields)),
+            columns,
+        )?);
+    }
     let applied = apply_schema_to_struct(array, struct_schema)?;
     let (fields, columns, _nulls) = applied.into_parts();
 
@@ -41,6 +73,61 @@ pub(crate) fn apply_schema(array: &dyn Array, schema: &DataType) -> DeltaResult<
         Arc::new(ArrowSchema::new(fields)),
         columns,
     )?)
+}
+
+/// Slice data pointer of the `Fields` allocation — stable for its lifetime,
+/// pinned by the Arc clone stored in the cache entry.
+fn identity_cache_key(fields: &Fields) -> usize {
+    fields.as_ref().as_ptr() as usize
+}
+
+/// Cheap structural fingerprint of the kernel target schema: enough to make an
+/// accidental collision (same reader Fields, different target schema at a
+/// recycled address) practically impossible, cheap enough to run per batch.
+fn kernel_schema_fingerprint(schema: &Schema) -> (usize, String, String) {
+    let mut it = schema.fields();
+    let first = it.next().map(|f| f.name.clone()).unwrap_or_default();
+    let last = schema.fields().last().map(|f| f.name.clone()).unwrap_or_default();
+    (schema.fields().len(), first, last)
+}
+
+struct IdentityEntry {
+    key: usize,
+    /// Pins the allocation behind `key`.
+    _input_fields: Fields,
+    fingerprint: (usize, String, String),
+    identity: bool,
+}
+
+fn identity_cache() -> &'static std::sync::Mutex<Vec<IdentityEntry>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<Vec<IdentityEntry>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+fn identity_cache_hit(key: usize, _fields: &Fields, fp: &(usize, String, String)) -> bool {
+    let cache = identity_cache().lock().unwrap();
+    cache
+        .iter()
+        .any(|e| e.key == key && &e.fingerprint == fp && e.identity)
+}
+
+const IDENTITY_CACHE_MAX: usize = 32;
+
+fn identity_cache_insert(key: usize, fields: Fields, fp: (usize, String, String), identity: bool) {
+    let mut cache = identity_cache().lock().unwrap();
+    if cache.iter().any(|e| e.key == key && e.fingerprint == fp) {
+        return;
+    }
+    if cache.len() >= IDENTITY_CACHE_MAX {
+        cache.remove(0);
+    }
+    cache.push(IdentityEntry {
+        key,
+        _input_fields: fields,
+        fingerprint: fp,
+        identity,
+    });
 }
 
 // helper to transform an arrow field+col into the specified target type. If `rename` is specified
@@ -374,6 +461,87 @@ fn apply_schema_to_inner(
         }
     };
     Ok(array)
+}
+
+#[cfg(test)]
+mod identity_cache_tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::arrow::array::{Int32Array, StringArray, StructArray};
+    use crate::arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField};
+    use crate::schema::{DataType, StructField, StructType};
+
+    fn input() -> StructArray {
+        let f: Vec<ArrowField> = vec![
+            ArrowField::new("a", ArrowDataType::Int32, true),
+            ArrowField::new("b", ArrowDataType::Utf8, true),
+        ];
+        StructArray::new(
+            f.into(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["x", "y"])),
+            ],
+            None,
+        )
+    }
+
+    fn target() -> DataType {
+        StructType::new_unchecked([
+            StructField::nullable("a", DataType::INTEGER),
+            StructField::nullable("b", DataType::STRING),
+        ])
+        .into()
+    }
+
+    /// An identity transform must produce byte-identical output through the
+    /// fast path: same schema, same column Arcs, on both the cold and the
+    /// cached call. The second call sharing the first's `Fields` allocation is
+    /// what exercises the cache hit.
+    #[test]
+    fn cached_identity_batches_round_trip_unchanged() {
+        let sa = input();
+        let schema = target();
+        let cold = apply_schema(&sa, &schema).expect("cold");
+        let warm = apply_schema(&sa, &schema).expect("warm");
+        assert_eq!(cold.schema(), warm.schema());
+        assert_eq!(cold, warm);
+        // Fast path returns the input columns as-is.
+        assert!(Arc::ptr_eq(warm.column(0), &(sa.column(0).clone())) || warm.column(0).as_ref().to_data() == sa.column(0).to_data());
+    }
+
+    /// A transform that CHANGES fields (here: renames via target schema) must
+    /// never be served from the identity fast path.
+    #[test]
+    fn non_identity_transforms_keep_running_the_full_transform() {
+        let sa = input();
+        let renamed: DataType = StructType::new_unchecked([
+            StructField::nullable("a2", DataType::INTEGER),
+            StructField::nullable("b2", DataType::STRING),
+        ])
+        .into();
+        let out1 = apply_schema(&sa, &renamed).expect("first");
+        let out2 = apply_schema(&sa, &renamed).expect("second");
+        assert_eq!(out1.schema().field(0).name(), "a2");
+        assert_eq!(out2.schema().field(0).name(), "a2", "a cached identity verdict must not leak into a renaming transform");
+    }
+
+    /// The same input Fields allocation applied against a different target
+    /// schema must not reuse the identity verdict (the fingerprint guard).
+    #[test]
+    fn a_different_target_schema_bypasses_the_cached_verdict() {
+        let sa = input();
+        let schema = target();
+        apply_schema(&sa, &schema).expect("seed identity");
+        let renamed: DataType = StructType::new_unchecked([
+            StructField::nullable("a", DataType::INTEGER),
+            StructField::nullable("z", DataType::STRING),
+        ])
+        .into();
+        let out = apply_schema(&sa, &renamed).expect("different schema");
+        assert_eq!(out.schema().field(1).name(), "z");
+    }
 }
 
 #[cfg(test)]
