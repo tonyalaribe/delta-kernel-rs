@@ -49,8 +49,7 @@ pub(crate) fn apply_schema(array: &dyn Array, schema: &DataType) -> DeltaResult<
     // against different kernel schemas.
     if let Some(sa) = array.as_struct_opt() {
         let key = identity_cache_key(sa.fields());
-        let fp = kernel_schema_fingerprint(struct_schema);
-        if identity_cache_hit(key, sa.fields(), &fp) {
+        if identity_cache_hit(key, struct_schema) {
             let (fields, columns, _nulls) = sa.clone().into_parts();
             return Ok(RecordBatch::try_new(
                 Arc::new(ArrowSchema::new(fields)),
@@ -59,7 +58,7 @@ pub(crate) fn apply_schema(array: &dyn Array, schema: &DataType) -> DeltaResult<
         }
         let applied = apply_schema_to_struct(array, struct_schema)?;
         let identity = applied.fields() == sa.fields();
-        identity_cache_insert(key, sa.fields().clone(), fp, identity);
+        identity_cache_insert(key, sa.fields().clone(), struct_schema.as_ref().clone(), identity);
         let (fields, columns, _nulls) = applied.into_parts();
         return Ok(RecordBatch::try_new(
             Arc::new(ArrowSchema::new(fields)),
@@ -81,21 +80,17 @@ fn identity_cache_key(fields: &Fields) -> usize {
     fields.as_ref().as_ptr() as usize
 }
 
-/// Cheap structural fingerprint of the kernel target schema: enough to make an
-/// accidental collision (same reader Fields, different target schema at a
-/// recycled address) practically impossible, cheap enough to run per batch.
-fn kernel_schema_fingerprint(schema: &Schema) -> (usize, String, String) {
-    let mut it = schema.fields();
-    let first = it.next().map(|f| f.name.clone()).unwrap_or_default();
-    let last = schema.fields().last().map(|f| f.name.clone()).unwrap_or_default();
-    (schema.fields().len(), first, last)
-}
-
 struct IdentityEntry {
     key: usize,
     /// Pins the allocation behind `key`.
     _input_fields: Fields,
-    fingerprint: (usize, String, String),
+    /// The exact target schema the verdict was computed against. Compared in
+    /// full on every hit: a name/count fingerprint would let two schemas that
+    /// differ only in the middle (a type widening, a metadata change) share a
+    /// verdict, silently skipping a transform the second schema needed. The
+    /// deep compare walks ~the field list once per batch — microseconds
+    /// against the multi-hundred-microsecond transform it replaces.
+    schema: Schema,
     identity: bool,
 }
 
@@ -105,18 +100,18 @@ fn identity_cache() -> &'static std::sync::Mutex<Vec<IdentityEntry>> {
     CACHE.get_or_init(Default::default)
 }
 
-fn identity_cache_hit(key: usize, _fields: &Fields, fp: &(usize, String, String)) -> bool {
+fn identity_cache_hit(key: usize, schema: &Schema) -> bool {
     let cache = identity_cache().lock().unwrap();
     cache
         .iter()
-        .any(|e| e.key == key && &e.fingerprint == fp && e.identity)
+        .any(|e| e.key == key && &e.schema == schema && e.identity)
 }
 
 const IDENTITY_CACHE_MAX: usize = 32;
 
-fn identity_cache_insert(key: usize, fields: Fields, fp: (usize, String, String), identity: bool) {
+fn identity_cache_insert(key: usize, fields: Fields, schema: Schema, identity: bool) {
     let mut cache = identity_cache().lock().unwrap();
-    if cache.iter().any(|e| e.key == key && e.fingerprint == fp) {
+    if cache.iter().any(|e| e.key == key && e.schema == schema) {
         return;
     }
     if cache.len() >= IDENTITY_CACHE_MAX {
@@ -125,7 +120,7 @@ fn identity_cache_insert(key: usize, fields: Fields, fp: (usize, String, String)
     cache.push(IdentityEntry {
         key,
         _input_fields: fields,
-        fingerprint: fp,
+        schema,
         identity,
     });
 }
