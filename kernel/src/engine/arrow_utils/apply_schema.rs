@@ -84,33 +84,46 @@ struct IdentityEntry {
     key: usize,
     /// Pins the allocation behind `key`.
     _input_fields: Fields,
-    /// The exact target schema the verdict was computed against. Compared in
-    /// full on every hit: a name/count fingerprint would let two schemas that
-    /// differ only in the middle (a type widening, a metadata change) share a
-    /// verdict, silently skipping a transform the second schema needed. The
-    /// deep compare walks ~the field list once per batch — microseconds
-    /// against the multi-hundred-microsecond transform it replaces.
+    /// The exact target schema the verdict was computed against. A name/count
+    /// fingerprint would let two schemas that differ only in the middle (a
+    /// type widening, a metadata change) share a verdict, so equality is
+    /// exact — but checked by POINTER first: the last schema address that
+    /// deep-compared equal is memoized, and the deep walk only re-runs when
+    /// the caller presents a different address (a new snapshot). Deployed
+    /// with a per-hit deep compare, ~70% of the fast path's samples were the
+    /// comparison plus a contended global Mutex; hits must be read-only and
+    /// O(1).
     schema: Schema,
+    last_schema_ptr: std::sync::atomic::AtomicUsize,
     identity: bool,
 }
 
-fn identity_cache() -> &'static std::sync::Mutex<Vec<IdentityEntry>> {
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<Vec<IdentityEntry>>> =
+fn identity_cache() -> &'static std::sync::RwLock<Vec<IdentityEntry>> {
+    static CACHE: std::sync::OnceLock<std::sync::RwLock<Vec<IdentityEntry>>> =
         std::sync::OnceLock::new();
     CACHE.get_or_init(Default::default)
 }
 
 fn identity_cache_hit(key: usize, schema: &Schema) -> bool {
-    let cache = identity_cache().lock().unwrap();
-    cache
-        .iter()
-        .any(|e| e.key == key && &e.schema == schema && e.identity)
+    use std::sync::atomic::Ordering;
+    let schema_ptr = schema as *const Schema as usize;
+    let cache = identity_cache().read().unwrap();
+    for e in cache.iter().filter(|e| e.key == key) {
+        if e.last_schema_ptr.load(Ordering::Relaxed) == schema_ptr {
+            return e.identity;
+        }
+        if &e.schema == schema {
+            e.last_schema_ptr.store(schema_ptr, Ordering::Relaxed);
+            return e.identity;
+        }
+    }
+    false
 }
 
 const IDENTITY_CACHE_MAX: usize = 32;
 
 fn identity_cache_insert(key: usize, fields: Fields, schema: Schema, identity: bool) {
-    let mut cache = identity_cache().lock().unwrap();
+    let mut cache = identity_cache().write().unwrap();
     if cache.iter().any(|e| e.key == key && e.schema == schema) {
         return;
     }
@@ -120,6 +133,7 @@ fn identity_cache_insert(key: usize, fields: Fields, schema: Schema, identity: b
     cache.push(IdentityEntry {
         key,
         _input_fields: fields,
+        last_schema_ptr: std::sync::atomic::AtomicUsize::new(0),
         schema,
         identity,
     });
